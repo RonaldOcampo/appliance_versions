@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -11,9 +10,10 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"time"
+	"io/ioutil"
+	"bytes"
 )
-
-type Appliances map[string]Cookbooks
 
 type Appliance struct {
 	Name     string                 `json:"name"`
@@ -25,17 +25,51 @@ type Appliance struct {
 	Metadata map[string]interface{} `json:"metadata"`
 }
 
+type ApplianceInfo struct {
+	OrigAppliance	Appliance		`json:"orig_appliance"`
+	LockedAppliance	Appliance		`json:"locked_appliance"`
+}
+
 type Step struct {
 	Role    string `json:"role"`
 	Package string `json:"package"`
 }
 
+type ApplianceList []ApplianceLinks
+
+type ApplianceLinks struct {
+	Name	string	`json:"name"`
+	Version	string	`json:"version"`
+	Links	[]Link	`json:"links"`
+}
+
+type PackageList []PackageLinks
+
+type PackageLinks struct {
+	Name	string	`json:"name"`
+	Version	string	`json:"version"`
+	Links	[]Link	`json:"links"`
+}
+
+type Link struct {
+	HREF	string	`json:"href"`
+	Rel		string	`json:"rel"`
+}
+
 type Package struct {
-	Name     string                 `json:"name"`
-	Version  string                 `json:"version"`
-	Command  string                 `json:"command"`
-	OS       string                 `json:"os"`
-	Metadata map[string]interface{} `json:"metadata"`
+	Name     			string                 	`json:"name"`
+	Version  			string                 	`json:"version"`
+	Command  			string                 	`json:"command"`
+	OS       			string                 	`json:"os"`
+	Metadata 			map[string]interface{} 	`json:"metadata"`
+}
+
+type PackageInfo struct {
+	OrigPackage			Package					`json:"orig_package"`
+	LockedPackage		Package					`json:"locked_package"`
+	KnifeCookbooks		Cookbooks				`json:"knife_cookbooks"`
+	OrigEnvironment		Environment				`json:"orig_environment"`
+	LockedEnvironment	Environment				`json:"locked_environment"`
 }
 
 type Cookbook struct {
@@ -58,61 +92,426 @@ type Environment struct {
 	OverridesAttributes map[string]interface{} `json:"override_attributes"`
 }
 
-// {
-//   "name": "spade_rabbitmq_mongodb_v5",
-//   "description": "The spade rabbitmq-mongodb appliance environment",
-//   "cookbook_versions": {
-//     "spade_mongodb": "~> 0.10.0",
-//     "spade_rabbitmq": "~> 0.4.0",
-//     "ultimate_mongodb": "~> 4.2.0"
-//   },
-//   "json_class": "Chef::Environment",
-//   "chef_type": "environment",
-//   "default_attributes": {
-//     "ossec": {
-//       "config": {
-//         "enable_email": false
-//       }
-//     }
-//   },
-//   "override_attributes": {
-//   }
-// }
-
 var (
-	applianceFlag  = flag.String("appl", "", "AMP Appliance name")
 	ampEndpoint    = "http://amp-prod.mia.ucloud.int:5001"
-	knifeFile      = "/Users/patrickr/hoth-deployment-orchestration/infrastructure/knife-paas.rb"
-	commandRegex   = regexp.MustCompile(`-o role\[(.*)\] -E (.*)`)
-	chefDirectory  = "/Users/patrickr/hoth-deployment-orchestration/infrastructure"
-	ucloudPrefixes = []string{"uc", "ult", "ultimate", "spade", "hardening", "logging", "monitoring"}
+	commandRegex   = regexp.MustCompile(`-o '?((recipe|role)\[.*\])'? *(-E)? *([a-zA-Z0-9_\-]*)?( -l debug)*`)
+	chefEnvironments = "./chef_environments"
+	ucloudPrefixes = []string{
+		"chrome",
+		"dot_net",
+		"firefox",
+		"gallio",
+		"hardening",
+		"innosetup",
+		"internet_explorer",
+		"jmeter",
+		"kms",
+		"logging",
+		"monitor",
+		"monitoring",
+		"openstack",
+		"spade_elasticsearch",
+		"spade_haproxy",
+		"spade_mongodb",
+		"spade_rabbitmq",
+		"spade_redis",
+		"spade_sql_server",
+		"spade_sql_server_2012",
+		"spade_ubuntu",
+		"swagger",
+		"swat-jumphost",
+		"symantec",
+		"teamcity",
+		"teamcity-server",
+		"teamcity_agent",
+		"test",
+		"tests",
+		"typescript",
+		"uc-apache2",
+		"uc-common",
+		"uc-elasticsearch",
+		"uc-grafana",
+		"uc-graphite",
+		"uc-kibana",
+		"uc-logagent",
+		"uc-logstash",
+		"uc-monit",
+		"uc-monitor",
+		"uc-ntpclient",
+		"uc-redis",
+		"uc-security",
+		"uc-serverspec",
+		"ucp_chef_server",
+		"ult-monitor",
+		"ult-rabbitmq",
+		"ult-ssh",
+		"ultimate_bower",
+		"ultimate_docker",
+		"ultimate_elasticsearch",
+		"ultimate_go",
+		"ultimate_grunt",
+		"ultimate_haproxy",
+		"ultimate_iis",
+		"ultimate_java",
+		"ultimate_mongodb",
+		"ultimate_mongodb_enterprise",
+		"ultimate_nodejs",
+		"ultimate_nvm",
+		"ultimate_ohai_plugins",
+		"ultimate_phantomjs",
+		"ultimate_python",
+		"ultimate_rabbitmq",
+		"ultimate_redis",
+		"ultimate_samba",
+		"ultimate_sql_server",
+		"ultimate_swagger",
+		"ultimate_ubuntu_app",
+		"ultimate_windows",
+		"utm_base",
+		"utm_build_agent",
+		"utm_sql_server",
+		"visual_studio",
+		"windows_patches",
+	}
 )
 
 func main() {
-	flag.Parse()
+	applianceList := getApplianceList()
+//	jsonPrettyPrint(os.Stdout, applianceList)
 
-	appliance := getAppliance(*applianceFlag)
-	jsonPrettyPrint(os.Stdout, appliance)
+	var updatedPackages = make(map[string]PackageInfo)
 
-	appliances := make(map[string]Cookbooks, 0)
-	for _, step := range appliance.Steps { // TODO: loop over appl_steps as well
-		pkg := getPackage(step.Package)
-		jsonPrettyPrint(os.Stdout, pkg)
+	os.Mkdir(chefEnvironments, 0755)
 
-		role, env := parseRoleAndEnv(pkg.Command)
-		output := knife("solve", "role["+role+"]", "-E", env, "-c", knifeFile)
-		log.Println(string(output))
-		cookbooks := parseCookbooks(output)
-		appliances[appliance.Name] = *cookbooks
-		jsonPrettyPrint(os.Stdout, cookbooks)
+	for _, applianceLinks := range *applianceList {
+		appliance := getAppliance(applianceLinks.Links[0].HREF)
+//		jsonPrettyPrint(os.Stdout, appliance)
+
+		applianceInfo := ApplianceInfo{OrigAppliance: *appliance, LockedAppliance: *appliance}
+
+		var createLockedAppliance bool
+
+		steps := make([]Step, 0)
+		log.Printf("Looping through steps for appliance %s", appliance.Name + "-" + appliance.Version)
+		for _, step := range appliance.Steps {
+			if pkgInfo, ok := updatedPackages[step.Package]; ok {
+				log.Printf("Package %s has already been updated to locked package %s", step.Package, pkgInfo.LockedPackage.Name + "-" + pkgInfo.LockedPackage.Version)
+				step.Package = pkgInfo.LockedPackage.Name + "-" + pkgInfo.LockedPackage.Version
+				steps = append(steps, step)
+				if strings.HasPrefix(pkgInfo.LockedPackage.Name, "l-") { createLockedAppliance = true }
+				continue
+			}
+
+			pkg := getPackage(step.Package)
+//			jsonPrettyPrint(os.Stdout, pkg)
+
+			pkgInfo := PackageInfo{OrigPackage: *pkg, LockedPackage: *pkg}
+
+			if !strings.Contains(pkg.Command, "chef-client") {
+				log.Printf("Skipping command without chef-client; package: %s; command: %s", pkg.Name, pkg.Command)
+				steps = append(steps, step)
+				updatedPackages[step.Package] = pkgInfo
+				continue
+			}
+
+			runList, env := parseRunListAndEnv(pkg.Command)
+//			log.Printf("RunList: %s, Env: %s", runList, env)
+			var output []byte
+			if env != "" {
+				output = knife("solve", runList, "-E", env)
+			} else {
+				output = knife("solve", runList)
+			}
+
+	//		log.Println(string(output))
+			cookbooks := parseCookbooks(output)
+			pkgInfo.KnifeCookbooks = *cookbooks
+//			jsonPrettyPrint(os.Stdout, pkgInfo)
+
+			output = []byte{}
+			if env != "" {
+				output = knife("environment", "show", env, "-fj")
+	//			log.Println(string(output))
+				origEnvironment := parseEnvironment(output)
+				pkgInfo.OrigEnvironment = *origEnvironment
+				pkgInfo.LockedEnvironment = *origEnvironment
+				pkgInfo.LockedEnvironment.Name = "l-" + pkg.Name + "-" + pkg.Version
+
+				var lockedCookbookVersions = make(map[string]string)
+				for _, cookbook := range pkgInfo.KnifeCookbooks.UCloud {
+					lockedCookbookVersions[cookbook.Name] = "= " + cookbook.Version
+				}
+				for _, cookbook := range pkgInfo.KnifeCookbooks.ThirdParty {
+					lockedCookbookVersions[cookbook.Name] = "= " + cookbook.Version
+				}
+				pkgInfo.LockedEnvironment.CookbookVersions = lockedCookbookVersions
+
+				pkgInfo.LockedPackage.Name = "l-" + pkg.Name
+				pkgInfo.LockedPackage.Command = strings.Replace(pkg.Command, "-E " + env, "-E " + pkgInfo.LockedEnvironment.Name, 1)
+
+			} else {
+				pkgInfo.LockedEnvironment.Name = "l-" + pkg.Name + "-" + pkg.Version
+				pkgInfo.LockedEnvironment.JSONClass = "Chef::Environment"
+				pkgInfo.LockedEnvironment.ChefType = "environment"
+				pkgInfo.LockedEnvironment.DefaultAttributes = make(map[string]interface{})
+				pkgInfo.LockedEnvironment.OverridesAttributes = make(map[string]interface{})
+
+				var lockedCookbookVersions = make(map[string]string)
+				for _, cookbook := range pkgInfo.KnifeCookbooks.UCloud {
+					lockedCookbookVersions[cookbook.Name] = "= " + cookbook.Version
+				}
+				for _, cookbook := range pkgInfo.KnifeCookbooks.ThirdParty {
+					lockedCookbookVersions[cookbook.Name] = "= " + cookbook.Version
+				}
+				pkgInfo.LockedEnvironment.CookbookVersions = lockedCookbookVersions
+
+				pkgInfo.LockedPackage.Name = "l-" + pkg.Name
+				pkgInfo.LockedPackage.Command = pkg.Command + " -E " + pkgInfo.LockedEnvironment.Name
+			}
+
+			data, err := json.MarshalIndent(pkgInfo.LockedEnvironment, " ", "  ")
+			if err != nil {
+				log.Fatalf("JSON Marshall: %v", err)
+			}
+
+			lockedEnvironmentFile := chefEnvironments + "/" + pkgInfo.LockedEnvironment.Name + ".json"
+			if err := ioutil.WriteFile(lockedEnvironmentFile, data, 0755); err != nil {
+				log.Fatalf("Failed to write to file: %v", err)
+			}
+
+			log.Printf("Creating new chef environment: %s", pkgInfo.LockedEnvironment.Name)
+//			output = knife("environment", "from", "file", lockedEnvironmentFile)
+//			log.Println(string(output))
+//			os.Exit(-1)
+
+			log.Printf("Creating new package %s", pkgInfo.LockedPackage.Name + "-" + pkgInfo.LockedPackage.Version)
+			jsonPrettyPrint(os.Stdout, pkgInfo)
+//			postPackage(&pkgInfo.LockedPackage)
+//			os.Exit(-1)
+
+			updatedPackages[step.Package] = pkgInfo
+			step.Package = pkgInfo.LockedPackage.Name + "-" + pkgInfo.LockedPackage.Version
+			steps = append(steps, step)
+			createLockedAppliance = true
+		}
+		applianceInfo.LockedAppliance.Steps = steps
+
+		steps = make([]Step, 0)
+		log.Printf("Looping through App steps for appliance %s", appliance.Name + "-" + appliance.Version)
+		for _, step := range appliance.AppSteps {
+			if pkgInfo, ok := updatedPackages[step.Package]; ok {
+				log.Printf("Package %s has already been updated to locked package %s", step.Package, pkgInfo.LockedPackage.Name + "-" + pkgInfo.LockedPackage.Version)
+				step.Package = pkgInfo.LockedPackage.Name + "-" + pkgInfo.LockedPackage.Version
+				steps = append(steps, step)
+				if strings.HasPrefix(pkgInfo.LockedPackage.Name, "l-") { createLockedAppliance = true }
+				continue
+			}
+
+			pkg := getPackage(step.Package)
+//			jsonPrettyPrint(os.Stdout, pkg)
+
+			pkgInfo := PackageInfo{OrigPackage: *pkg, LockedPackage: *pkg}
+
+			if !strings.Contains(pkg.Command, "chef-client") {
+				log.Printf("Skipping command without chef-client; package: %s; command: %s", pkg.Name, pkg.Command)
+				steps = append(steps, step)
+				updatedPackages[step.Package] = pkgInfo
+				continue
+			}
+
+			runList, env := parseRunListAndEnv(pkg.Command)
+//			log.Printf("RunList: %s, Env: %s", runList, env)
+			var output []byte
+			if env != "" {
+				output = knife("solve", runList, "-E", env)
+			} else {
+				output = knife("solve", runList)
+			}
+
+//			log.Println(string(output))
+			cookbooks := parseCookbooks(output)
+			pkgInfo.KnifeCookbooks = *cookbooks
+//			jsonPrettyPrint(os.Stdout, pkgInfo)
+
+			output = []byte{}
+			if env != "" {
+				output = knife("environment", "show", env, "-fj")
+	//			log.Println(string(output))
+				origEnvironment := parseEnvironment(output)
+				pkgInfo.OrigEnvironment = *origEnvironment
+				pkgInfo.LockedEnvironment = *origEnvironment
+				pkgInfo.LockedEnvironment.Name = "l-" + pkg.Name + "-" + pkg.Version
+
+				var lockedCookbookVersions = make(map[string]string)
+				for _, cookbook := range pkgInfo.KnifeCookbooks.UCloud {
+					lockedCookbookVersions[cookbook.Name] = "= " + cookbook.Version
+				}
+				for _, cookbook := range pkgInfo.KnifeCookbooks.ThirdParty {
+					lockedCookbookVersions[cookbook.Name] = "= " + cookbook.Version
+				}
+				pkgInfo.LockedEnvironment.CookbookVersions = lockedCookbookVersions
+
+				pkgInfo.LockedPackage.Name = "l-" + pkg.Name
+				pkgInfo.LockedPackage.Command = strings.Replace(pkg.Command, "-E " + env, "-E " + pkgInfo.LockedEnvironment.Name, 1)
+
+			} else {
+				pkgInfo.LockedEnvironment.Name = "l-" + pkg.Name + "-" + pkg.Version
+				pkgInfo.LockedEnvironment.JSONClass = "Chef::Environment"
+				pkgInfo.LockedEnvironment.ChefType = "environment"
+				pkgInfo.LockedEnvironment.DefaultAttributes = make(map[string]interface{})
+				pkgInfo.LockedEnvironment.OverridesAttributes = make(map[string]interface{})
+
+				var lockedCookbookVersions = make(map[string]string)
+				for _, cookbook := range pkgInfo.KnifeCookbooks.UCloud {
+					lockedCookbookVersions[cookbook.Name] = "= " + cookbook.Version
+				}
+				for _, cookbook := range pkgInfo.KnifeCookbooks.ThirdParty {
+					lockedCookbookVersions[cookbook.Name] = "= " + cookbook.Version
+				}
+				pkgInfo.LockedEnvironment.CookbookVersions = lockedCookbookVersions
+
+				pkgInfo.LockedPackage.Name = "l-" + pkg.Name
+				pkgInfo.LockedPackage.Command = pkg.Command + " -E " + pkgInfo.LockedEnvironment.Name
+			}
+
+			data, err := json.MarshalIndent(pkgInfo.LockedEnvironment, " ", "  ")
+			if err != nil {
+				log.Fatalf("JSON Marshall: %v", err)
+			}
+
+			lockedEnvironmentFile := chefEnvironments + "/" + pkgInfo.LockedEnvironment.Name + ".json"
+			if err := ioutil.WriteFile(lockedEnvironmentFile, data, 0755); err != nil {
+				log.Fatalf("Failed to write to file: %v", err)
+			}
+
+			log.Printf("Creating new chef environment: %s", pkgInfo.LockedEnvironment.Name)
+//			output = knife("environment", "from", "file", lockedEnvironmentFile)
+//			log.Println(string(output))
+//			os.Exit(-1)
+
+			log.Printf("Creating new package %s", pkgInfo.LockedPackage.Name + "-" + pkgInfo.LockedPackage.Version)
+			jsonPrettyPrint(os.Stdout, pkgInfo)
+//			postPackage(&pkgInfo.LockedPackage)
+//			os.Exit(-1)
+
+			updatedPackages[step.Package] = pkgInfo
+			step.Package = pkgInfo.LockedPackage.Name + "-" + pkgInfo.LockedPackage.Version
+			steps = append(steps, step)
+			createLockedAppliance = true
+		}
+		applianceInfo.LockedAppliance.AppSteps = steps
+
+		if createLockedAppliance {
+			applianceInfo.LockedAppliance.Name = "l-" + appliance.Name
+
+			log.Printf("Creating new appliance %s", applianceInfo.LockedAppliance.Name + "-" + applianceInfo.LockedAppliance.Version)
+			jsonPrettyPrint(os.Stdout, applianceInfo)
+//			postAppliance(&applianceInfo.LockedAppliance)
+//			os.Exit(-1)
+		}
+	}
+}
+func postPackage(pkg *Package) {
+	packagesURI := ampEndpoint + "/packages"
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(pkg); err != nil {
+		log.Fatalf("JSON encode: %v", err)
 	}
 
-	http.HandleFunc("/appliances", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		jsonPrettyPrint(w, appliances)
-	})
+	req, err := http.NewRequest("POST", packagesURI, &buf)
+	if err != nil {
+		log.Fatalf("JSON encode: %v", err)
+	}
 
-	http.ListenAndServe("0.0.0.0:5002", nil)
+	resp, err := http.DefaultClient.Do(req);
+	if err != nil {
+		log.Fatalf("POST %s : %v", packagesURI, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 201 {
+		log.Fatalf("Package POST status: %s", resp.Status)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+}
+
+func postAppliance(appliance *Appliance) {
+	appliancesURI := ampEndpoint + "/appliances"
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(appliance); err != nil {
+		log.Fatalf("JSON encode: %v", err)
+	}
+
+	req, err := http.NewRequest("POST", appliancesURI, &buf)
+	if err != nil {
+		log.Fatalf("JSON encode: %v", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Fatalf("POST %s : %v", appliancesURI, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 201 {
+		log.Fatalf("Appliance POST status: %s", resp.Status)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+}
+
+func getApplianceList() *ApplianceList {
+	log.Print("Querying AMP for appliance list ...")
+	appliancesURI := ampEndpoint + "/appliances"
+	resp, err := http.Get(appliancesURI)
+	if err != nil {
+		log.Fatalf("GET %s : %v", appliancesURI, err)
+	}
+	defer resp.Body.Close()
+
+	var applianceList ApplianceList
+	if err := json.NewDecoder(resp.Body).Decode(&applianceList); err != nil {
+		log.Fatalf("JSON decode: %v", err)
+	}
+
+	return &applianceList
+}
+
+func getPackageList() *PackageList {
+	log.Print("Querying AMP for package list ...")
+	packagesURI := ampEndpoint + "/packages"
+	resp, err := http.Get(packagesURI)
+	if err != nil {
+		log.Fatalf("GET %s : %v", packagesURI, err)
+	}
+	defer resp.Body.Close()
+
+	var packageList PackageList
+	if err := json.NewDecoder(resp.Body).Decode(&packageList); err != nil {
+		log.Fatalf("JSON decode: %v", err)
+	}
+
+	return &packageList
+}
+
+func getPackage(packageName string) *Package {
+	log.Printf("Querying AMP for package '%s' ...", packageName)
+	packageURI := ampEndpoint + "/packages/" + packageName
+	resp, err := http.Get(packageURI)
+	if err != nil {
+		log.Fatalf("GET %s : %v", packageURI, err)
+	}
+	defer resp.Body.Close()
+
+	var pkg Package
+	if err := json.NewDecoder(resp.Body).Decode(&pkg); err != nil {
+		log.Fatalf("JSON decode: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	return &pkg
 }
 
 func parseCookbooks(data []byte) *Cookbooks {
@@ -123,7 +522,7 @@ func parseCookbooks(data []byte) *Cookbooks {
 		cookbook := Cookbook{Name: cols[0], Version: cols[1]}
 		var ucloudOwned bool
 		for _, prefix := range ucloudPrefixes {
-			if strings.HasPrefix(cookbook.Name, prefix) {
+			if cookbook.Name == prefix {
 				ucloudOwned = true
 				break
 			}
@@ -139,16 +538,16 @@ func parseCookbooks(data []byte) *Cookbooks {
 	return &cookbooks
 }
 
-func knife(cmd string, args ...string) []byte {
-	pwd, err := os.Getwd()
-	if err != nil {
-		log.Fatalf("knife: %v", err)
+func parseEnvironment(data []byte) *Environment {
+	var origEnvironment Environment
+	if err := json.Unmarshal(data, &origEnvironment); err != nil {
+		log.Fatalf("JSON decode: %v", err)
 	}
-	if err := os.Chdir(chefDirectory); err != nil {
-		log.Fatalf("knife: %v", err)
-	}
-	defer os.Chdir(pwd)
 
+	return &origEnvironment
+}
+
+func knife(cmd string, args ...string) []byte {
 	args = append([]string{cmd}, args...)
 	output, err := exec.Command("knife", args...).Output()
 	if err != nil {
@@ -158,9 +557,9 @@ func knife(cmd string, args ...string) []byte {
 	return output
 }
 
-func getAppliance(name string) *Appliance {
-	log.Printf("Querying AMP for appliance '%s' ...", name)
-	applianceURI := ampEndpoint + "/appliances/" + name
+func getAppliance(applianceURI string) *Appliance {
+	info := strings.Split(applianceURI, "/")
+	log.Printf("Querying AMP for appliance '%s' ...", info[len(info)-1])
 	resp, err := http.Get(applianceURI)
 	if err != nil {
 		log.Fatalf("GET %s : %v", applianceURI, err)
@@ -172,32 +571,19 @@ func getAppliance(name string) *Appliance {
 		log.Fatalf("JSON decode: %v", err)
 	}
 
+	time.Sleep(100 * time.Millisecond)
+
 	return &appliance
 }
 
-func getPackage(name string) *Package {
-	log.Printf("Querying AMP for package '%s' ...", name)
-	packageURI := ampEndpoint + "/packages/" + name
-	resp, err := http.Get(packageURI)
-	if err != nil {
-		log.Fatalf("GET %s : %v", packageURI, err)
-	}
-	defer resp.Body.Close()
-
-	var pkg Package
-	if err := json.NewDecoder(resp.Body).Decode(&pkg); err != nil {
-		log.Fatalf("JSON decode: %v", err)
-	}
-
-	return &pkg
-}
-
-func parseRoleAndEnv(command string) (string, string) {
+func parseRunListAndEnv(command string) (string, string) {
 	matches := commandRegex.FindStringSubmatch(command)
-	if len(matches) != 3 {
+//	log.Printf("matches: %v, %d", matches, len(matches))
+	if len(matches) != 6 {
 		log.Fatalf("parseRoleAndEnv could not parse role and environment from: %s", command)
 	}
-	return matches[1], matches[2]
+
+	return matches[1], matches[4]
 }
 
 func jsonPrettyPrint(w io.Writer, v interface{}) {
