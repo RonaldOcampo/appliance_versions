@@ -20,7 +20,7 @@ type Appliance struct {
 	Version  string                 `json:"version"`
 	Roles    map[string]interface{} `json:"roles"`
 	Steps    []Step                 `json:"steps"`
-	AppSteps []Step                 `json:"app_steps"`
+	AppSteps []AppStep              `json:"app_steps"`
 	Options  map[string]interface{} `json:"options"`
 	Metadata map[string]interface{} `json:"metadata"`
 }
@@ -28,11 +28,26 @@ type Appliance struct {
 type ApplianceInfo struct {
 	OrigAppliance	Appliance		`json:"orig_appliance"`
 	LockedAppliance	Appliance		`json:"locked_appliance"`
+	AppStepInfos	[]AppStepInfo	`json:"app_step_infos"`
 }
 
 type Step struct {
 	Role    string `json:"role"`
 	Package string `json:"package"`
+}
+
+type AppStep struct {
+	Role    string `json:"role"`
+	Command string `json:"command"`
+	Name 	string `json:"name"`
+}
+
+type AppStepInfo struct {
+	OrigAppStep			AppStep					`json:"orig_app_step"`
+	LockedAppStep		AppStep					`json:"locked_app_step"`
+	KnifeCookbooks		Cookbooks				`json:"knife_cookbooks"`
+	OrigEnvironment		Environment				`json:"orig_environment"`
+	LockedEnvironment	Environment				`json:"locked_environment"`
 }
 
 type ApplianceList []ApplianceLinks
@@ -296,30 +311,19 @@ func main() {
 		}
 		applianceInfo.LockedAppliance.Steps = steps
 
-		steps = make([]Step, 0)
-		log.Printf("Looping through App steps for appliance %s", appliance.Name + "-" + appliance.Version)
-		for _, step := range appliance.AppSteps {
-			if pkgInfo, ok := updatedPackages[step.Package]; ok {
-				log.Printf("Package %s has already been updated to locked package %s", step.Package, pkgInfo.LockedPackage.Name + "-" + pkgInfo.LockedPackage.Version)
-				step.Package = pkgInfo.LockedPackage.Name + "-" + pkgInfo.LockedPackage.Version
-				steps = append(steps, step)
-				if strings.HasPrefix(pkgInfo.LockedPackage.Name, "l-") { createLockedAppliance = true }
+		appSteps := make([]AppStep, 0)
+		appStepInfos := make([]AppStepInfo, 0)
+		log.Printf("Looping through app steps for appliance %s", appliance.Name + "-" + appliance.Version)
+		for _, appStep := range appliance.AppSteps {
+			appStepInfo := AppStepInfo{OrigAppStep: appStep, LockedAppStep: appStep}
+			if !strings.Contains(appStep.Command, "chef-client") {
+				log.Printf("Skipping app step without chef-client; app_step: %s; command: %s", appStep.Name, appStep.Command)
+				appSteps = append(appSteps, appStep)
+				appStepInfos = append(appStepInfos, appStepInfo)
 				continue
 			}
 
-			pkg := getPackage(step.Package)
-//			jsonPrettyPrint(os.Stdout, pkg)
-
-			pkgInfo := PackageInfo{OrigPackage: *pkg, LockedPackage: *pkg}
-
-			if !strings.Contains(pkg.Command, "chef-client") {
-				log.Printf("Skipping command without chef-client; package: %s; command: %s", pkg.Name, pkg.Command)
-				steps = append(steps, step)
-				updatedPackages[step.Package] = pkgInfo
-				continue
-			}
-
-			runList, env := parseRunListAndEnv(pkg.Command)
+			runList, env := parseRunListAndEnv(appStep.Command)
 //			log.Printf("RunList: %s, Env: %s", runList, env)
 			var output []byte
 			if env != "" {
@@ -330,76 +334,71 @@ func main() {
 
 //			log.Println(string(output))
 			cookbooks := parseCookbooks(output)
-			pkgInfo.KnifeCookbooks = *cookbooks
-//			jsonPrettyPrint(os.Stdout, pkgInfo)
+			appStepInfo.KnifeCookbooks = *cookbooks
+//			jsonPrettyPrint(os.Stdout, appStepInfo)
 
 			output = []byte{}
 			if env != "" {
 				output = knife("environment", "show", env, "-fj")
 	//			log.Println(string(output))
 				origEnvironment := parseEnvironment(output)
-				pkgInfo.OrigEnvironment = *origEnvironment
-				pkgInfo.LockedEnvironment = *origEnvironment
-				pkgInfo.LockedEnvironment.Name = "l-" + pkg.Name + "-" + pkg.Version
+				appStepInfo.OrigEnvironment = *origEnvironment
+				appStepInfo.LockedEnvironment = *origEnvironment
+				appStepInfo.LockedEnvironment.Name = "l-" + appliance.Name + "-" + strings.Replace(appliance.Version, ".", "-", -1) + "-" + strings.Replace(appStep.Name, " ", "-", -1)
 
 				var lockedCookbookVersions = make(map[string]string)
-				for _, cookbook := range pkgInfo.KnifeCookbooks.UCloud {
+				for _, cookbook := range appStepInfo.KnifeCookbooks.UCloud {
 					lockedCookbookVersions[cookbook.Name] = "= " + cookbook.Version
 				}
-				for _, cookbook := range pkgInfo.KnifeCookbooks.ThirdParty {
+				for _, cookbook := range appStepInfo.KnifeCookbooks.ThirdParty {
 					lockedCookbookVersions[cookbook.Name] = "= " + cookbook.Version
 				}
-				pkgInfo.LockedEnvironment.CookbookVersions = lockedCookbookVersions
+				appStepInfo.LockedEnvironment.CookbookVersions = lockedCookbookVersions
 
-				pkgInfo.LockedPackage.Name = "l-" + pkg.Name
-				pkgInfo.LockedPackage.Command = strings.Replace(pkg.Command, "-E " + env, "-E " + pkgInfo.LockedEnvironment.Name, 1)
+				appStepInfo.LockedAppStep.Name = "l-" + appStep.Name
+				appStepInfo.LockedAppStep.Command = strings.Replace(appStep.Command, "-E " + env, "-E " + appStepInfo.LockedEnvironment.Name, 1)
 
 			} else {
-				pkgInfo.LockedEnvironment.Name = "l-" + pkg.Name + "-" + pkg.Version
-				pkgInfo.LockedEnvironment.JSONClass = "Chef::Environment"
-				pkgInfo.LockedEnvironment.ChefType = "environment"
-				pkgInfo.LockedEnvironment.DefaultAttributes = make(map[string]interface{})
-				pkgInfo.LockedEnvironment.OverridesAttributes = make(map[string]interface{})
+				appStepInfo.LockedEnvironment.Name = "l-" + appliance.Name + "-" + strings.Replace(appliance.Version, ".", "-", -1) + "-" + strings.Replace(appStep.Name, " ", "-", -1)
+				appStepInfo.LockedEnvironment.JSONClass = "Chef::Environment"
+				appStepInfo.LockedEnvironment.ChefType = "environment"
+				appStepInfo.LockedEnvironment.DefaultAttributes = make(map[string]interface{})
+				appStepInfo.LockedEnvironment.OverridesAttributes = make(map[string]interface{})
 
 				var lockedCookbookVersions = make(map[string]string)
-				for _, cookbook := range pkgInfo.KnifeCookbooks.UCloud {
+				for _, cookbook := range appStepInfo.KnifeCookbooks.UCloud {
 					lockedCookbookVersions[cookbook.Name] = "= " + cookbook.Version
 				}
-				for _, cookbook := range pkgInfo.KnifeCookbooks.ThirdParty {
+				for _, cookbook := range appStepInfo.KnifeCookbooks.ThirdParty {
 					lockedCookbookVersions[cookbook.Name] = "= " + cookbook.Version
 				}
-				pkgInfo.LockedEnvironment.CookbookVersions = lockedCookbookVersions
+				appStepInfo.LockedEnvironment.CookbookVersions = lockedCookbookVersions
 
-				pkgInfo.LockedPackage.Name = "l-" + pkg.Name
-				pkgInfo.LockedPackage.Command = pkg.Command + " -E " + pkgInfo.LockedEnvironment.Name
+				appStepInfo.LockedAppStep.Name = "l-" + appStep.Name
+				appStepInfo.LockedAppStep.Command = appStep.Command + " -E " + appStepInfo.LockedEnvironment.Name
 			}
 
-			data, err := json.MarshalIndent(pkgInfo.LockedEnvironment, " ", "  ")
+			data, err := json.MarshalIndent(appStepInfo.LockedEnvironment, " ", "  ")
 			if err != nil {
 				log.Fatalf("JSON Marshall: %v", err)
 			}
 
-			lockedEnvironmentFile := chefEnvironments + "/" + pkgInfo.LockedEnvironment.Name + ".json"
+			lockedEnvironmentFile := chefEnvironments + "/" + appStepInfo.LockedEnvironment.Name + ".json"
 			if err := ioutil.WriteFile(lockedEnvironmentFile, data, 0755); err != nil {
 				log.Fatalf("Failed to write to file: %v", err)
 			}
 
-			log.Printf("Creating new chef environment: %s", pkgInfo.LockedEnvironment.Name)
+			log.Printf("Creating new chef environment: %s", appStepInfo.LockedEnvironment.Name)
 //			output = knife("environment", "from", "file", lockedEnvironmentFile)
 //			log.Println(string(output))
 //			os.Exit(-1)
 
-			log.Printf("Creating new package %s", pkgInfo.LockedPackage.Name + "-" + pkgInfo.LockedPackage.Version)
-			jsonPrettyPrint(os.Stdout, pkgInfo)
-//			postPackage(&pkgInfo.LockedPackage)
-//			os.Exit(-1)
-
-			updatedPackages[step.Package] = pkgInfo
-			step.Package = pkgInfo.LockedPackage.Name + "-" + pkgInfo.LockedPackage.Version
-			steps = append(steps, step)
+			appSteps = append(appSteps, appStepInfo.LockedAppStep)
+			appStepInfos = append(appStepInfos, appStepInfo)
 			createLockedAppliance = true
 		}
-		applianceInfo.LockedAppliance.AppSteps = steps
+		applianceInfo.LockedAppliance.AppSteps = appSteps
+		applianceInfo.AppStepInfos = appStepInfos
 
 		if createLockedAppliance {
 			applianceInfo.LockedAppliance.Name = "l-" + appliance.Name
