@@ -111,6 +111,7 @@ var (
 	ampEndpoint    = "http://amp-prod.mia.ucloud.int:5001"
 	commandRegex   = regexp.MustCompile(`-o '?((recipe|role)\[.*\])'? *(-E)? *([a-zA-Z0-9_\-]*)?( -l debug)*`)
 	chefEnvironments = "./chef_environments"
+	latestAppliancesFile = "./latest_appliances_list"
 	ucloudPrefixes = []string{
 		"chrome",
 		"dot_net",
@@ -194,11 +195,27 @@ func main() {
 	applianceList := getApplianceList()
 //	jsonPrettyPrint(os.Stdout, applianceList)
 
+	var latestAppliances = make(map[string]bool)
+	content, err := ioutil.ReadFile(latestAppliancesFile)
+	if err != nil {
+		log.Fatalf("Could not read file %s: %v", latestAppliancesFile, err)
+	}
+	for _, appliance := range strings.Split(string(content), "\r\n") {
+		latestAppliances[appliance] = true
+	}
+//	fmt.Printf("latest appliances: %v", latestAppliances)
+//	os.Exit(-1)
+
 	var updatedPackages = make(map[string]PackageInfo)
 
 	os.Mkdir(chefEnvironments, 0755)
 
 	for _, applianceLinks := range *applianceList {
+		if !latestAppliances[applianceLinks.Name + "-"  + applianceLinks.Version] {
+			log.Printf("Skipping appliance that is not latest version: %s", applianceLinks.Name + "-"  + applianceLinks.Version)
+			continue
+		}
+
 		appliance := getAppliance(applianceLinks.Links[0].HREF)
 //		jsonPrettyPrint(os.Stdout, appliance)
 
@@ -400,8 +417,10 @@ func main() {
 		applianceInfo.LockedAppliance.AppSteps = appSteps
 		applianceInfo.AppStepInfos = appStepInfos
 
+
 		if createLockedAppliance {
-			applianceInfo.LockedAppliance.Name = "l-" + appliance.Name
+//			applianceInfo.LockedAppliance.Name = "l-" + appliance.Name
+			applianceInfo.LockedAppliance.Version = "1.0.0"
 
 			log.Printf("Creating new appliance %s", applianceInfo.LockedAppliance.Name + "-" + applianceInfo.LockedAppliance.Version)
 			jsonPrettyPrint(os.Stdout, applianceInfo)

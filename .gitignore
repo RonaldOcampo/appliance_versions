@@ -1,3 +1,13 @@
 chef_environments
 info.txt
 output.txt
+locked_appliances
+locked_appliances.json
+locked_packages
+locked_packages.json
+all_cookbooks_paas_chef
+all_cookbooks_rec_chef
+locked_environments
+locked_latest_appliances
+windows_cookbooks_paas_chef
+windows_cookbooks_rec_chef
